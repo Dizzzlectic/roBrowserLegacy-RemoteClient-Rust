@@ -438,6 +438,48 @@ fn an_entry_pointing_past_the_end_of_the_archive_is_an_error_not_an_allocation()
 }
 
 #[test]
+fn ordinary_inflation_requires_the_declared_size_and_a_complete_stream() {
+    let dir = TempDir::new("grf-inflate-bounds");
+    let path = dir.join("test.grf");
+    let content = vec![0x42; 2 * 1024 * 1024];
+    GrfBuilder::new()
+        .file("data\\compressed.bin", &content)
+        .write_v300(&path);
+    let grf = Grf::open(&path).unwrap();
+    let entry = grf.files[0].entry;
+    assert_eq!(grf.read_entry(&entry).unwrap(), content);
+
+    let mut undersized = entry;
+    undersized.real_size = 16;
+    assert_eq!(
+        grf.read_entry(&undersized)
+            .map(|data| data.len())
+            .expect_err("oversized output must fail")
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    // The advertised output may fit even though the checksum trailer is missing.
+    let mut truncated = entry;
+    truncated.compressed_size -= 4;
+    truncated.length_aligned = truncated.compressed_size;
+    assert_eq!(
+        grf.read_entry(&truncated)
+            .map(|data| data.len())
+            .expect_err("truncated stream must fail")
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    // Exercise the same bound for the archive table as well as file content.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let table = u64::from_le_bytes(bytes[30..38].try_into().unwrap()) as usize + 46;
+    bytes[table + 8..table + 12].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    assert!(Grf::open(&path).is_err());
+}
+
+#[test]
 fn a_file_table_header_pointing_past_the_end_is_rejected() {
     let dir = TempDir::new("grf-bad-table");
     let path = dir.join("bad.grf");

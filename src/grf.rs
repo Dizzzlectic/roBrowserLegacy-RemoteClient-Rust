@@ -5,11 +5,11 @@
 //! or buffered whole.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::des;
 use crate::encoding::{detect_best_encoding, FilenameEncoding};
@@ -170,6 +170,25 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 
 fn u32_le(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// Callers bound the declared size before allocating. One extra byte detects
+/// expansion past it; unlike read_to_end, the inflater cannot grow this buffer.
+/// Alignment bytes after a complete ordinary stream are allowed.
+fn inflate_exact(data: &[u8], expected: u32) -> io::Result<Vec<u8>> {
+    let mut output = vec![0; expected as usize + 1];
+    let mut inflater = Decompress::new(true);
+    let status = inflater
+        .decompress(data, &mut output, FlushDecompress::Finish)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if status != Status::StreamEnd || inflater.total_out() != u64::from(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GRF zlib stream is truncated or differs from its declared output size",
+        ));
+    }
+    output.truncate(expected as usize);
+    Ok(output)
 }
 
 struct Header {
@@ -562,20 +581,9 @@ impl Grf {
                 compressed_size as usize,
             )?;
 
-            let mut data = Vec::with_capacity(real_size as usize);
-            ZlibDecoder::new(&compressed[..])
-                .read_to_end(&mut data)
-                .map_err(|e| {
-                    GrfError::CorruptTable(format!("Failed to decompress file table: {e}"))
-                })?;
-
-            if data.len() != real_size as usize {
-                return Err(GrfError::CorruptTable(format!(
-                    "File table size mismatch: expected {}, got {}",
-                    real_size,
-                    data.len()
-                )));
-            }
+            let data = inflate_exact(&compressed, real_size).map_err(|e| {
+                GrfError::CorruptTable(format!("Failed to decompress file table: {e}"))
+            })?;
             (data, compressed_size, real_size)
         };
 
@@ -683,6 +691,12 @@ impl Grf {
 
     /// Read and decode one entry.  Blocking: call from a blocking context.
     pub fn read_entry(&self, entry: &GrfEntry) -> io::Result<Vec<u8>> {
+        if entry.real_size > MAX_FILE_UNCOMPRESSED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GRF entry output exceeds supported size limit",
+            ));
+        }
         if entry.length_aligned == 0 && !entry.is_protected() {
             return Ok(Vec::new());
         }
@@ -756,9 +770,7 @@ impl Grf {
             return Ok(data);
         }
 
-        let mut out = Vec::with_capacity(entry.real_size as usize);
-        ZlibDecoder::new(&data[..]).read_to_end(&mut out)?;
-        Ok(out)
+        inflate_exact(&data, entry.real_size)
     }
 }
 
