@@ -228,6 +228,10 @@ impl Client {
 
     /// `file`'s bytes in `coding`, made once and kept with the cached entry;
     /// `None` when that coding does not make it smaller.
+    ///
+    /// A file the cache would not keep (over a tenth of its budget) has
+    /// nowhere to keep an encoding either, so it is encoded cheaply for each
+    /// request instead, as every asset was before encodings were kept.
     pub async fn encoded(
         self: &Arc<Self>,
         req_path: &str,
@@ -240,13 +244,20 @@ impl Client {
         let this = Arc::clone(self);
         let key = Self::cache_key(req_path);
         let file = file.clone();
+        if !self.cache.holds(&key, &file) {
+            return tokio::task::spawn_blocking(move || {
+                encode_asset(coding, &file.data, false).map(Arc::new)
+            })
+            .await
+            .unwrap_or(None);
+        }
         tokio::task::spawn_blocking(move || {
             let mut made = None;
             let result = file
                 .encodings
                 .slot(coding)
                 .get_or_init(|| {
-                    let encoded = encode_asset(coding, &file.data).map(Arc::new);
+                    let encoded = encode_asset(coding, &file.data, true).map(Arc::new);
                     made = encoded.as_ref().map(|e| e.len());
                     encoded
                 })

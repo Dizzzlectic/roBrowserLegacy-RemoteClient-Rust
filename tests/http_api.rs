@@ -251,6 +251,71 @@ async fn a_client_that_offers_br_gets_brotli_and_the_same_bytes_each_time() {
 }
 
 #[tokio::test]
+async fn each_encoding_of_an_asset_has_its_own_etag_and_revalidates_against_it() {
+    let (_dir, server) = server(&[]).await;
+    let get = |headers: Vec<(&'static str, String)>| {
+        let addr = server.addr;
+        async move {
+            let headers: Vec<(&str, &str)> =
+                headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            request(addr, "GET", "/data/big.spr", &headers, None).await
+        }
+    };
+    let plain = get(vec![]).await;
+    let gzip = get(vec![("Accept-Encoding", "gzip".into())]).await;
+    let br = get(vec![("Accept-Encoding", "br".into())]).await;
+    let tags: Vec<String> = [&plain, &gzip, &br]
+        .iter()
+        .map(|r| r.header("etag").unwrap().to_string())
+        .collect();
+    assert!(tags[1].ends_with("-gz\""), "{}", tags[1]);
+    assert!(tags[2].ends_with("-br\""), "{}", tags[2]);
+    assert_ne!(tags[0], tags[1]);
+    assert_ne!(tags[1], tags[2]);
+
+    // Each tag revalidates its own representation, with Vary on the 304.
+    for (accept, tag) in [("", &tags[0]), ("gzip", &tags[1]), ("br", &tags[2])] {
+        let mut headers = vec![("If-None-Match", tag.clone())];
+        if !accept.is_empty() {
+            headers.push(("Accept-Encoding", accept.into()));
+        }
+        let response = get(headers).await;
+        assert_eq!(response.status, 304, "{accept}");
+        assert_eq!(response.header("etag"), Some(tag.as_str()));
+        assert_eq!(response.header("vary"), Some("Accept-Encoding"));
+    }
+    // The plain tag is not a match for the brotli body.
+    let response = get(vec![
+        ("Accept-Encoding", "br".into()),
+        ("If-None-Match", tags[0].clone()),
+    ])
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-encoding"), Some("br"));
+}
+
+#[tokio::test]
+async fn an_asset_too_big_to_cache_is_still_encoded_and_nothing_is_kept() {
+    // A zero budget caches nothing, as for a file over a tenth of the budget.
+    let (_dir, server) = server(&[("CACHE_MAX_MEMORY_MB", "0")]).await;
+    for _ in 0..2 {
+        let response = request(
+            server.addr,
+            "GET",
+            "/data/big.spr",
+            &[("Accept-Encoding", "gzip")],
+            None,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header("content-encoding"), Some("gzip"));
+        assert_eq!(response.body, vec![0x11u8; 40_000]);
+    }
+    let stats = request(server.addr, "GET", "/api/cache-stats", &[], None).await;
+    assert_eq!(stats.json()["cache"]["memoryUsedMB"], "0.00");
+}
+
+#[tokio::test]
 async fn a_plain_answer_to_a_compressible_asset_still_varies_on_accept_encoding() {
     let (_dir, server) = server(&[]).await;
     let response = request(server.addr, "GET", "/data/big.spr", &[], None).await;

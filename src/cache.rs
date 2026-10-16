@@ -171,6 +171,16 @@ impl FileCache {
         file
     }
 
+    /// True when `file` is the entry cached under `key`, so an encoding made
+    /// for it has somewhere to be kept.
+    pub fn holds(&self, key: &str, file: &CachedFile) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .map
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.encodings, &file.encodings))
+    }
+
     /// Count `bytes` of a newly made encoding of `file` against the budget,
     /// if `file` is still the entry cached under `key`.
     pub fn add_encoding(&self, key: &str, file: &CachedFile, bytes: usize) {

@@ -2,6 +2,7 @@
 //! compression and CORS.
 
 use std::io::Write;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::header::{
@@ -11,6 +12,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
@@ -178,10 +180,15 @@ pub fn asset_coding(
 
 /// `data` in `coding`, or `None` when that is not smaller.  Tens of
 /// milliseconds for a large table, so call it off the async workers.
-pub fn encode_asset(coding: Coding, data: &[u8]) -> Option<Vec<u8>> {
+///
+/// `kept` says the result is stored with the cached file.  A file too big to
+/// cache is encoded again for every request, so it gets the cheapest
+/// settings instead (gzip level 1, as before encodings were kept).
+pub fn encode_asset(coding: Coding, data: &[u8], kept: bool) -> Option<Vec<u8>> {
     let encoded = match coding {
         Coding::Gzip => {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::new(ASSET_GZIP_LEVEL));
+            let level = if kept { ASSET_GZIP_LEVEL } else { 1 };
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
             encoder.write_all(data).ok()?;
             encoder.finish().ok()?
         }
@@ -191,7 +198,7 @@ pub fn encode_asset(coding: Coding, data: &[u8]) -> Option<Vec<u8>> {
                 let mut writer = brotli::CompressorWriter::new(
                     &mut out,
                     4096,
-                    ASSET_BROTLI_QUALITY,
+                    if kept { ASSET_BROTLI_QUALITY } else { 1 },
                     ASSET_BROTLI_WINDOW,
                 );
                 writer.write_all(data).ok()?;
@@ -224,18 +231,40 @@ pub fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
         .any(|candidate| candidate == quoted || candidate == "*")
 }
 
+/// The ETag of a file's body in `coding`.  Each representation has its own,
+/// so a cache that revalidates one never gets a 304 meant for another.
+pub fn coded_etag(etag: &str, coding: Option<Coding>) -> String {
+    match coding {
+        Some(Coding::Br) => format!("{etag}-br"),
+        Some(Coding::Gzip) => format!("{etag}-gz"),
+        None => etag.to_string(),
+    }
+}
+
+/// Bytes kept in the cache, handed to a response body without a copy.
+pub fn shared_body(data: Arc<Vec<u8>>) -> Bytes {
+    struct Shared(Arc<Vec<u8>>);
+    impl AsRef<[u8]> for Shared {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    Bytes::from_owner(Shared(data))
+}
+
 /// Build the response for a resolved asset, honouring conditional requests.
 ///
-/// `encoded` is the body already in the coding [`asset_coding`] chose, when
-/// that came out smaller; `vary` is [`negotiates_coding`], so a cache keeps
-/// the encoded and plain bodies apart even when this one is plain.
+/// `body` is already in `coding` (`None` for the bytes as they are), and
+/// `etag` is that representation's tag ([`coded_etag`]).  `vary` is
+/// [`negotiates_coding`], so a cache keeps the encoded and plain bodies
+/// apart even when this one is plain.
 pub fn asset_response(
     request_headers: &HeaderMap,
     path: &str,
-    data: &[u8],
+    body: Bytes,
     etag: Option<&str>,
     vary: bool,
-    encoded: Option<(Coding, &[u8])>,
+    coding: Option<Coding>,
 ) -> Response {
     let ext = extension_of(path);
     let content_type = content_type_for(&ext);
@@ -244,7 +273,13 @@ pub fn asset_response(
     if is_static {
         if let Some(etag) = etag {
             if etag_matches(request_headers, etag) {
-                return not_modified(etag);
+                let mut response = not_modified(etag);
+                if vary {
+                    response
+                        .headers_mut()
+                        .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+                }
+                return response;
             }
         }
     }
@@ -273,13 +308,10 @@ pub fn asset_response(
     if vary {
         builder = builder.header(VARY, "Accept-Encoding");
     }
-    match encoded {
-        Some((coding, body)) => builder
-            .header(CONTENT_ENCODING, coding.name())
-            .body(Body::from(body.to_vec()))
-            .unwrap(),
-        None => builder.body(Body::from(data.to_vec())).unwrap(),
+    if let Some(coding) = coding {
+        builder = builder.header(CONTENT_ENCODING, coding.name());
     }
+    builder.body(Body::from(body)).unwrap()
 }
 
 pub fn not_modified(etag: &str) -> Response {
