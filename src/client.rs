@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::cache::{CacheStats, CachedFile, FileCache};
 use crate::config::Config;
-use crate::encoding::{decode_mojibake, js_lowercase, to_mojibake};
+use crate::encoding::{decode_mojibake, js_lowercase, to_mojibake, windows1252_to_latin1};
 use crate::grf::Grf;
 use crate::index::{norm_forward, AssetIndex};
 use crate::util::{confined_file, iso_now, public_asset_path, safe_join};
@@ -186,6 +186,16 @@ impl Client {
             let decoded = decode_mojibake(req_path);
             if decoded != req_path {
                 hit = self.index.lookup(&decoded);
+            }
+        }
+        // 6. The same, with windows-1252 letters put back to their bytes: how
+        //    roBrowser spells a CP949 byte in 0x80..=0x9F (see encoding.rs).
+        if hit.is_none() {
+            if let Some(latin1) = windows1252_to_latin1(req_path) {
+                hit = self.index.lookup(&latin1);
+                if hit.is_none() {
+                    hit = self.index.lookup(&decode_mojibake(&latin1));
+                }
             }
         }
 
