@@ -339,12 +339,32 @@ async fn serve_path(State(state): State<AppState>, request: Request) -> Response
     // 3. Assets: local files, the override directory, then the archives.
     match state.client.get_file(&relative).await {
         Some(file) => {
+            let coding = http::asset_coding(
+                &headers,
+                &relative,
+                file.data.len(),
+                state.cfg.enable_compression,
+            );
+            // A revalidation that will be answered 304 needs no body made.
+            let revalidating = |coding| {
+                http::is_static_extension(&extension_of(&relative))
+                    && http::etag_matches(&headers, &http::coded_etag(&file.etag, coding))
+            };
+            let (coding, body) = match coding {
+                Some(coding) if revalidating(Some(coding)) => (Some(coding), bytes::Bytes::new()),
+                Some(coding) => match state.client.encoded(&relative, &file, coding).await {
+                    Some(encoded) => (Some(coding), http::shared_body(encoded)),
+                    None => (None, http::shared_body(file.data.clone())),
+                },
+                None => (None, http::shared_body(file.data.clone())),
+            };
             let response = http::asset_response(
                 &headers,
                 &relative,
-                &file.data,
-                Some(&file.etag),
-                state.cfg.enable_compression,
+                body,
+                Some(&http::coded_etag(&file.etag, coding)),
+                http::negotiates_coding(&relative, file.data.len(), state.cfg.enable_compression),
+                coding,
             );
             finish(response, is_head)
         }
