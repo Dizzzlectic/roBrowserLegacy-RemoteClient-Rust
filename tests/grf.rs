@@ -83,6 +83,36 @@ fn a_protected_entry_keeps_its_original_filename_hash_through_the_index() {
 }
 
 #[test]
+fn a_corrupted_or_truncated_protected_archive_is_an_error_not_a_panic() {
+    // Flip each byte of a keyed protected archive, then cut it at each length:
+    // opening it and reading every entry may fail, but must never panic.
+    let dir = TempDir::new("grf-protected-corrupt");
+    let path = dir.join("protected.grf");
+    write_protected_archive(
+        &path,
+        include_bytes!("fixtures/protected-keyed.bin"),
+        1400,
+        include_bytes!("fixtures/protected-footer.bin"),
+    );
+    let original = std::fs::read(&path).unwrap();
+    let damaged = (0..original.len())
+        .map(|at| {
+            let mut bytes = original.clone();
+            bytes[at] ^= 0xff;
+            bytes
+        })
+        .chain((0..original.len()).map(|len| original[..len].to_vec()));
+    for bytes in damaged {
+        std::fs::write(&path, &bytes).unwrap();
+        if let Ok(grf) = Grf::open(&path) {
+            for file in &grf.files {
+                let _ = grf.read_entry(&file.entry);
+            }
+        }
+    }
+}
+
+#[test]
 fn a_v300_archive_rejects_a_malformed_key_block() {
     let dir = TempDir::new("grf-bad-key-block");
     let path = dir.join("protected.grf");

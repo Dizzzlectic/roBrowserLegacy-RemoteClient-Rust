@@ -392,6 +392,31 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_or_truncated_payloads_and_key_blocks_never_panic() {
+        // Every fixture, with each byte flipped and cut at each length.
+        fn damaged(original: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
+            (0..original.len())
+                .map(|at| {
+                    let mut bytes = original.to_vec();
+                    bytes[at] ^= 0xff;
+                    bytes
+                })
+                .chain((0..original.len()).map(|len| original[..len].to_vec()))
+        }
+        for row in fixtures() {
+            let keys = decode_archive_keys(&row.keys).unwrap_or_default();
+            let name = filename_hash(&row.name);
+            let seeded = seeded_filename_hash(&row.name, row.size);
+            for payload in damaged(&row.payload) {
+                let _ = decode_entry(&payload, &name, &seeded, row.size, &keys);
+            }
+            for key_block in damaged(&row.keys) {
+                let _ = decode_archive_keys(&key_block);
+            }
+        }
+    }
+
+    #[test]
     fn lengths_and_output_hashes_are_checked_before_accepting_content() {
         for tag in [
             "oversized-output",
