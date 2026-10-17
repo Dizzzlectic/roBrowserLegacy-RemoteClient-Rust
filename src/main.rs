@@ -14,8 +14,6 @@ use robrowser_remoteclient::routes::{self, AppState};
 use robrowser_remoteclient::{error, info, logger, managed::Managed, validator};
 
 fn main() {
-    pin_mmap_threshold();
-
     // The blocking pool does the GRF reads; the async runtime does the sockets.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -31,31 +29,6 @@ fn main() {
     let code = runtime.block_on(run());
     std::process::exit(code);
 }
-
-/// Keeps glibc from holding on to the brotli encoder's scratch memory.
-///
-/// glibc serves allocations above a threshold with their own `mmap`, handed
-/// back on free, but it raises that threshold each time such a block is
-/// freed.  After the first few brotli encodes, its multi-megabyte buffers come
-/// from the heap instead, one heap per blocking thread, and stay there: on a
-/// replayed game session that was about 200 MB of RSS nothing was using.
-/// Pinning the threshold keeps them on `mmap`.  Other allocators return large
-/// blocks by themselves.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn pin_mmap_threshold() {
-    extern "C" {
-        fn mallopt(param: i32, value: i32) -> i32;
-    }
-    const M_MMAP_THRESHOLD: i32 = -3;
-    // SAFETY: `mallopt` only changes glibc's allocator settings, and runs
-    // before any other thread exists.
-    unsafe {
-        mallopt(M_MMAP_THRESHOLD, 1 << 20);
-    }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn pin_mmap_threshold() {}
 
 async fn run() -> i32 {
     // `.env` first, so it can set NODE_ENV before anything reads it.

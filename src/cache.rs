@@ -30,14 +30,12 @@ pub struct CachedFile {
 /// `None` means it was tried and came out no smaller.
 #[derive(Default)]
 pub struct Encodings {
-    br: OnceLock<Option<Arc<Vec<u8>>>>,
     gzip: OnceLock<Option<Arc<Vec<u8>>>>,
 }
 
 impl Encodings {
     pub fn slot(&self, coding: Coding) -> &OnceLock<Option<Arc<Vec<u8>>>> {
         match coding {
-            Coding::Br => &self.br,
             Coding::Gzip => &self.gzip,
         }
     }
@@ -136,8 +134,7 @@ impl FileCache {
             encodings: encodings.clone(),
         };
 
-        // One file must not be allowed to own the whole budget.
-        if self.max_size == 0 || size as f64 > self.max_memory_bytes as f64 * 0.1 {
+        if !self.keeps(size) {
             return file;
         }
 
@@ -171,14 +168,10 @@ impl FileCache {
         file
     }
 
-    /// True when `file` is the entry cached under `key`, so an encoding made
-    /// for it has somewhere to be kept.
-    pub fn holds(&self, key: &str, file: &CachedFile) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .map
-            .get(key)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.encodings, &file.encodings))
+    /// True when a file of `len` bytes is one the cache keeps: one file must
+    /// not be allowed to own the whole budget, so nothing over a tenth of it.
+    pub fn keeps(&self, len: usize) -> bool {
+        self.max_size != 0 && len as f64 <= self.max_memory_bytes as f64 * 0.1
     }
 
     /// Count `bytes` of a newly made encoding of `file` against the budget,

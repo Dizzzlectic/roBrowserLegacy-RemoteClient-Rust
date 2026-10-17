@@ -128,16 +128,21 @@ pub fn accepts_encoding(headers: &HeaderMap, coding: &str) -> bool {
 }
 
 /// A content coding the server makes for game assets.
+///
+/// Gzip only.  Brotli was tried for clients that offer it (the HTTPS sharing
+/// tunnel): it sent about 9% less than kept gzip-6 over a replayed game
+/// session, but its encoder's scratch memory raised the server's peak RSS by
+/// 250-350 MB on macOS, where the allocator returns freed pages lazily.
+/// Prebuilt `.br` siblings of the client files cost no encoding and are
+/// still served (see `serve_static`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coding {
-    Br,
     Gzip,
 }
 
 impl Coding {
     pub fn name(self) -> &'static str {
         match self {
-            Coding::Br => "br",
             Coding::Gzip => "gzip",
         }
     }
@@ -147,11 +152,6 @@ impl Coding {
 /// it is paid once per file rather than once per request: level 6 makes the
 /// `.lub` tables about a third smaller than level 1, at about 60 MB/s.
 const ASSET_GZIP_LEVEL: u32 = 6;
-/// Brotli quality and window for game assets.  Quality 5 is where brotli
-/// stops getting much smaller for what it costs: half the size of level-1
-/// gzip on the text tables, at about the speed of gzip level 6.
-const ASSET_BROTLI_QUALITY: u32 = 5;
-const ASSET_BROTLI_WINDOW: u32 = 22;
 
 /// True when `path` is a game asset worth compressing, so its answer depends
 /// on `Accept-Encoding` whether or not this client gets it compressed.
@@ -163,7 +163,6 @@ pub fn negotiates_coding(path: &str, len: usize, compression_enabled: bool) -> b
 }
 
 /// The coding to send `path` in, or `None` for its bytes as they are.
-/// Browsers offer `br` only over HTTPS, so a player on the LAN gets gzip.
 pub fn asset_coding(
     request_headers: &HeaderMap,
     path: &str,
@@ -173,7 +172,7 @@ pub fn asset_coding(
     if !negotiates_coding(path, len, compression_enabled) {
         return None;
     }
-    [Coding::Br, Coding::Gzip]
+    [Coding::Gzip]
         .into_iter()
         .find(|coding| accepts_encoding(request_headers, coding.name()))
 }
@@ -191,20 +190,6 @@ pub fn encode_asset(coding: Coding, data: &[u8], kept: bool) -> Option<Vec<u8>> 
             let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
             encoder.write_all(data).ok()?;
             encoder.finish().ok()?
-        }
-        Coding::Br => {
-            let mut out = Vec::new();
-            {
-                let mut writer = brotli::CompressorWriter::new(
-                    &mut out,
-                    4096,
-                    if kept { ASSET_BROTLI_QUALITY } else { 1 },
-                    ASSET_BROTLI_WINDOW,
-                );
-                writer.write_all(data).ok()?;
-                writer.flush().ok()?;
-            }
-            out
         }
     };
     (encoded.len() < data.len()).then_some(encoded)
@@ -235,7 +220,6 @@ pub fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 /// so a cache that revalidates one never gets a 304 meant for another.
 pub fn coded_etag(etag: &str, coding: Option<Coding>) -> String {
     match coding {
-        Some(Coding::Br) => format!("{etag}-br"),
         Some(Coding::Gzip) => format!("{etag}-gz"),
         None => etag.to_string(),
     }

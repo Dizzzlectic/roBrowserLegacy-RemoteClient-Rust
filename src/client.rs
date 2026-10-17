@@ -232,6 +232,12 @@ impl Client {
     /// A file the cache would not keep (over a tenth of its budget) has
     /// nowhere to keep an encoding either, so it is encoded cheaply for each
     /// request instead, as every asset was before encodings were kept.
+    ///
+    /// Which settings a file gets depends on its size alone, never on whether
+    /// this copy is still the cached one, so a coding's ETag always names the
+    /// same bytes.  Concurrent first requests each insert the file, and all
+    /// but the last hold a copy the cache has already replaced: those encode
+    /// at the kept settings too, and `add_encoding` counts nothing for them.
     pub async fn encoded(
         self: &Arc<Self>,
         req_path: &str,
@@ -244,7 +250,7 @@ impl Client {
         let this = Arc::clone(self);
         let key = Self::cache_key(req_path);
         let file = file.clone();
-        if !self.cache.holds(&key, &file) {
+        if !self.cache.keeps(file.data.len()) {
             return tokio::task::spawn_blocking(move || {
                 encode_asset(coding, &file.data, false).map(Arc::new)
             })
