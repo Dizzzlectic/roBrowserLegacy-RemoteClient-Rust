@@ -2,6 +2,7 @@
 //! compression and CORS.
 
 use std::io::Write;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::header::{
@@ -11,6 +12,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
@@ -96,10 +98,107 @@ pub fn accepts_gzip(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `Accept-Encoding` admits `coding`: the coding listed by name
+/// (case-insensitive) with a non-zero `q`, or, when it is not listed, a
+/// non-zero `*`.  `br;q=0` is a refusal, not a match.
+pub fn accepts_encoding(headers: &HeaderMap, coding: &str) -> bool {
+    let Some(value) = headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let mut wildcard = None;
+    for item in value.split(',') {
+        let mut parts = item.split(';');
+        let name = parts.next().unwrap_or("").trim();
+        // A missing `q` is 1; one that does not parse is treated as a refusal.
+        let acceptable = parts
+            .find_map(|param| {
+                let (key, q) = param.split_once('=')?;
+                key.trim().eq_ignore_ascii_case("q").then(|| q.trim())
+            })
+            .map(|q| q.parse::<f32>().map(|q| q > 0.0).unwrap_or(false))
+            .unwrap_or(true);
+        if name.eq_ignore_ascii_case(coding) {
+            return acceptable;
+        }
+        if name == "*" {
+            wildcard = Some(acceptable);
+        }
+    }
+    wildcard.unwrap_or(false)
+}
+
+/// A content coding the server makes for game assets.
+///
+/// Gzip only.  Brotli was tried for clients that offer it (the HTTPS sharing
+/// tunnel): it sent about 9% less than kept gzip-6 over a replayed game
+/// session, but its encoder's scratch memory raised the server's peak RSS by
+/// 250-350 MB on macOS, where the allocator returns freed pages lazily.
+/// Prebuilt `.br` siblings of the client files cost no encoding and are
+/// still served (see `serve_static`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coding {
+    Gzip,
+}
+
+impl Coding {
+    pub fn name(self) -> &'static str {
+        match self {
+            Coding::Gzip => "gzip",
+        }
+    }
+}
+
+/// Gzip level for game assets.  The result is kept with the cached file, so
+/// it is paid once per file rather than once per request: level 6 makes the
+/// `.lub` tables about a third smaller than level 1, at about 60 MB/s.
+const ASSET_GZIP_LEVEL: u32 = 6;
+
+/// True when `path` is a game asset worth compressing, so its answer depends
+/// on `Accept-Encoding` whether or not this client gets it compressed.
+pub fn negotiates_coding(path: &str, len: usize, compression_enabled: bool) -> bool {
+    let ext = extension_of(path);
+    compression_enabled
+        && len >= COMPRESSION_THRESHOLD
+        && is_compressible(&ext, content_type_for(&ext))
+}
+
+/// The coding to send `path` in, or `None` for its bytes as they are.
+pub fn asset_coding(
+    request_headers: &HeaderMap,
+    path: &str,
+    len: usize,
+    compression_enabled: bool,
+) -> Option<Coding> {
+    if !negotiates_coding(path, len, compression_enabled) {
+        return None;
+    }
+    [Coding::Gzip]
+        .into_iter()
+        .find(|coding| accepts_encoding(request_headers, coding.name()))
+}
+
+/// `data` in `coding`, or `None` when that is not smaller.  Tens of
+/// milliseconds for a large table, so call it off the async workers.
+///
+/// `kept` says the result is stored with the cached file.  A file too big to
+/// cache is encoded again for every request, so it gets the cheapest
+/// settings instead (gzip level 1, as before encodings were kept).
+pub fn encode_asset(coding: Coding, data: &[u8], kept: bool) -> Option<Vec<u8>> {
+    let encoded = match coding {
+        Coding::Gzip => {
+            let level = if kept { ASSET_GZIP_LEVEL } else { 1 };
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
+            encoder.write_all(data).ok()?;
+            encoder.finish().ok()?
+        }
+    };
+    (encoded.len() < data.len()).then_some(encoded)
+}
+
 fn gzip(data: &[u8]) -> Option<Vec<u8>> {
-    // Level 1: game assets are already deflate-compressed inside the GRF, so
-    // the wire saving comes cheap or not at all.  Spending 40 ms on level 6 for
-    // a sprite the client wanted five milliseconds ago is a bad trade.
+    // Level 1, for responses made per request (JSON, the landing page): they
+    // are not kept, so each one pays.  Game assets go through `encode_asset`,
+    // whose result is kept with the cached file.
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(1));
     encoder.write_all(data).ok()?;
     encoder.finish().ok()
@@ -117,14 +216,39 @@ pub fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
         .any(|candidate| candidate == quoted || candidate == "*")
 }
 
-/// Build the response for a resolved asset, honouring conditional requests and
-/// negotiating compression.
+/// The ETag of a file's body in `coding`.  Each representation has its own,
+/// so a cache that revalidates one never gets a 304 meant for another.
+pub fn coded_etag(etag: &str, coding: Option<Coding>) -> String {
+    match coding {
+        Some(Coding::Gzip) => format!("{etag}-gz"),
+        None => etag.to_string(),
+    }
+}
+
+/// Bytes kept in the cache, handed to a response body without a copy.
+pub fn shared_body(data: Arc<Vec<u8>>) -> Bytes {
+    struct Shared(Arc<Vec<u8>>);
+    impl AsRef<[u8]> for Shared {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    Bytes::from_owner(Shared(data))
+}
+
+/// Build the response for a resolved asset, honouring conditional requests.
+///
+/// `body` is already in `coding` (`None` for the bytes as they are), and
+/// `etag` is that representation's tag ([`coded_etag`]).  `vary` is
+/// [`negotiates_coding`], so a cache keeps the encoded and plain bodies
+/// apart even when this one is plain.
 pub fn asset_response(
     request_headers: &HeaderMap,
     path: &str,
-    data: &[u8],
+    body: Bytes,
     etag: Option<&str>,
-    compression_enabled: bool,
+    vary: bool,
+    coding: Option<Coding>,
 ) -> Response {
     let ext = extension_of(path);
     let content_type = content_type_for(&ext);
@@ -133,7 +257,13 @@ pub fn asset_response(
     if is_static {
         if let Some(etag) = etag {
             if etag_matches(request_headers, etag) {
-                return not_modified(etag);
+                let mut response = not_modified(etag);
+                if vary {
+                    response
+                        .headers_mut()
+                        .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+                }
+                return response;
             }
         }
     }
@@ -159,25 +289,13 @@ pub fn asset_response(
         builder = builder.header(CACHE_CONTROL, "no-cache, no-store, must-revalidate");
     }
 
-    let compress = compression_enabled
-        && data.len() >= COMPRESSION_THRESHOLD
-        && is_compressible(&ext, content_type)
-        && accepts_gzip(request_headers);
-
-    if compress {
-        if let Some(gz) = gzip(data) {
-            // Only worth it if it actually got smaller.
-            if gz.len() < data.len() {
-                return builder
-                    .header(CONTENT_ENCODING, "gzip")
-                    .header(VARY, "Accept-Encoding")
-                    .body(Body::from(gz))
-                    .unwrap();
-            }
-        }
+    if vary {
+        builder = builder.header(VARY, "Accept-Encoding");
     }
-
-    builder.body(Body::from(data.to_vec())).unwrap()
+    if let Some(coding) = coding {
+        builder = builder.header(CONTENT_ENCODING, coding.name());
+    }
+    builder.body(Body::from(body)).unwrap()
 }
 
 pub fn not_modified(etag: &str) -> Response {
@@ -369,6 +487,27 @@ mod tests {
         let mut star = HeaderMap::new();
         star.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
         assert!(etag_matches(&star, "anything"));
+    }
+
+    #[test]
+    fn accept_encoding_is_matched_by_token_and_honours_q_zero() {
+        let accepts = |value: &'static str, coding: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT_ENCODING, HeaderValue::from_static(value));
+            accepts_encoding(&headers, coding)
+        };
+        assert!(accepts("gzip, deflate, br", "br"));
+        assert!(accepts("gzip, deflate, br", "gzip"));
+        assert!(accepts("BR;q=0.5", "br"));
+        assert!(!accepts("br;q=0, gzip", "br"));
+        assert!(!accepts("br; q=0.000", "br"));
+        assert!(accepts("br; q=0.001", "br"));
+        assert!(!accepts("brotli, gzipx", "br"));
+        assert!(!accepts("brotli, gzipx", "gzip"));
+        assert!(accepts("*", "br"));
+        assert!(!accepts("*, br;q=0", "br"));
+        assert!(!accepts("identity", "gzip"));
+        assert!(!accepts_encoding(&HeaderMap::new(), "gzip"));
     }
 
     #[test]
